@@ -63,6 +63,7 @@ pub struct LoanId(pub Address, pub u64);
 pub enum LoanStatus {
     Active,
     Repaid,
+    Defaulted,
 }
 
 #[contracttype]
@@ -142,6 +143,16 @@ pub struct LoanCreatedEvent {
 pub struct LoanRepaidEvent {
     pub loan_id: u64,
     pub borrower: Address,
+    pub amount: i128,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct LoanDefaultedEvent {
+    pub loan_id: u64,
+    pub borrower: Address,
+    pub lender: Address,
     pub amount: i128,
     pub timestamp: u64,
 }
@@ -254,7 +265,7 @@ impl LendingPool {
     /// pool balance. `amount` must be positive. Emits a [`DepositEvent`].
     pub fn deposit(env: Env, lender: Address, amount: i128) {
         // Re-entrancy guard
-        reentrancy_guard::acquire_guard(&env);
+        let _guard = reentrancy_guard::acquire_guard(&env);
 
         lender.require_auth();
         Self::check_paused(&env);
@@ -299,7 +310,6 @@ impl LendingPool {
         );
 
         // Release re-entrancy guard
-        reentrancy_guard::release_guard(&env);
     }
 
     /// Withdraw `amount` of ACBU from the caller's pool balance.
@@ -310,7 +320,7 @@ impl LendingPool {
     /// least [`MIN_POOL_BALANCE`]; otherwise it fails with [`Error::DustBalance`].
     pub fn withdraw(env: Env, lender: Address, amount: i128) {
         // Re-entrancy guard
-        reentrancy_guard::acquire_guard(&env);
+        let _guard = reentrancy_guard::acquire_guard(&env);
 
         lender.require_auth();
         Self::check_paused(&env);
@@ -375,7 +385,6 @@ impl LendingPool {
             .publish((symbol_short!("withdraw"), lender), amount);
 
         // Release re-entrancy guard
-        reentrancy_guard::release_guard(&env);
     }
 
     /// Borrow `amount` of ACBU from a specific `lender`'s liquidity, creating
@@ -417,7 +426,7 @@ impl LendingPool {
         loan_id: u64,
     ) {
         // Re-entrancy guard
-        reentrancy_guard::acquire_guard(&env);
+        let _guard = reentrancy_guard::acquire_guard(&env);
 
         borrower.require_auth();
         // The loan is unsecured (see the function docs), so the lender bears the
@@ -538,7 +547,6 @@ impl LendingPool {
         );
 
         // Release re-entrancy guard
-        reentrancy_guard::release_guard(&env);
     }
 
     /// Return the loan identified by `(borrower, loan_id)`, or `None` if it does
@@ -552,7 +560,7 @@ impl LendingPool {
         let loan_key = LoanId(borrower, loan_id);
         let mut loan_data: LoanData = env.storage().persistent().get(&DataKey::Loan(loan_key))?;
 
-        if let LoanStatus::Repaid = loan_data.status {
+        if !matches!(loan_data.status, LoanStatus::Active) {
             return Some(loan_data);
         }
 
@@ -577,6 +585,98 @@ impl LendingPool {
         Some(loan_data)
     }
 
+    /// Write off an overdue loan and release the lender's reserved liquidity.
+    ///
+    /// Requires the lender's authorization. The outstanding principal is
+    /// removed from the lender's tracked balance because the pool no longer
+    /// holds those tokens, preventing a withdrawal from exceeding the pool's
+    /// actual token balance. The loan remains in storage as [`LoanStatus::Defaulted`]
+    /// for auditability, but no longer blocks the lender's remaining liquidity.
+    pub fn liquidate(env: Env, lender: Address, borrower: Address, loan_id: u64) {
+        let _guard = reentrancy_guard::acquire_guard(&env);
+
+        lender.require_auth();
+        Self::check_paused(&env);
+
+        let loan_key = LoanId(borrower.clone(), loan_id);
+        let mut loan_data = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Loan(loan_key.clone()))
+            .unwrap_or_else(|| env.panic_with_error(Error::NotFound));
+
+        if loan_data.lender != lender {
+            env.panic_with_error(Error::Unauthorized);
+        }
+        if !matches!(loan_data.status, LoanStatus::Active) {
+            env.panic_with_error(Error::InvalidState);
+        }
+        if env.ledger().timestamp() <= loan_data.repayment_deadline {
+            env.panic_with_error(Error::InvalidState);
+        }
+
+        let outstanding_principal = loan_data.amount;
+        let active_loans_liquidity: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ActiveLoansLiquidity)
+            .unwrap_or(0);
+        env.storage().instance().set(
+            &DataKey::ActiveLoansLiquidity,
+            &active_loans_liquidity
+                .checked_sub(outstanding_principal)
+                .unwrap_or(0),
+        );
+
+        let lender_balance: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Balance(lender.clone()))
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &DataKey::Balance(lender.clone()),
+            &lender_balance
+                .checked_sub(outstanding_principal)
+                .unwrap_or_else(|| env.panic_with_error(Error::InvalidState)),
+        );
+
+        let already_borrowed: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Borrowed(lender.clone()))
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &DataKey::Borrowed(lender.clone()),
+            &already_borrowed
+                .checked_sub(outstanding_principal)
+                .unwrap_or(0),
+        );
+
+        loan_data.status = LoanStatus::Defaulted;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Loan(loan_key.clone()), &loan_data);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Loan(loan_key),
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_BUMP,
+        );
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_BUMP);
+
+        env.events().publish(
+            (symbol_short!("loan_def"),),
+            LoanDefaultedEvent {
+                loan_id,
+                borrower,
+                lender,
+                amount: outstanding_principal,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+    }
+
     /// Repay `amount` toward the loan `(borrower, loan_id)`.
     ///
     /// Requires `borrower`'s authorization and that the pool is not paused.
@@ -590,7 +690,7 @@ impl LendingPool {
     /// and [`LoanRepaidEvent`].
     pub fn repay(env: Env, borrower: Address, amount: i128, loan_id: u64) {
         // Re-entrancy guard
-        reentrancy_guard::acquire_guard(&env);
+        let _guard = reentrancy_guard::acquire_guard(&env);
 
         borrower.require_auth();
         Self::check_paused(&env);
@@ -739,7 +839,6 @@ impl LendingPool {
         );
 
         // Release re-entrancy guard
-        reentrancy_guard::release_guard(&env);
     }
 
     /// Pause the pool, disabling deposit/withdraw/borrow/repay. Admin only.
